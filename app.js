@@ -32,6 +32,13 @@ const copyText = async value => {
     return copied;
   } catch { return false; }
 };
+// Shared guestbook connection. Configure this in supabase-config.js.
+const supabaseConfig = window.GUESTBOOK_SUPABASE || {};
+const supabaseClient = (window.supabase && supabaseConfig.url && supabaseConfig.anonKey &&
+  !supabaseConfig.url.includes("YOUR_") && !supabaseConfig.anonKey.includes("YOUR_"))
+  ? window.supabase.createClient(supabaseConfig.url, supabaseConfig.anonKey)
+  : null;
+let guestbookChannel = null;
 const store = { get: (k, d) => { try { return JSON.parse(localStorage.getItem(k)) ?? d } catch { return d } },
                 set: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)) } catch {} } };
 const posts = (Array.isArray(POSTS) ? POSTS : [])
@@ -405,32 +412,82 @@ function about() {
   </section>`;
 }
 
-function guestbook() {
-  const storedEntries = store.get("gargi-guestbook", []);
-  const entries = Array.isArray(storedEntries) ? storedEntries.filter(e => e && typeof e.name === "string" && typeof e.message === "string") : [];
+async function guestbook() {
+  if (guestbookChannel && supabaseClient) {
+    await supabaseClient.removeChannel(guestbookChannel);
+    guestbookChannel = null;
+  }
   app.innerHTML = `<section class="guestbook-page">
     <span class="eyebrow">THE VISITORS' PAGE</span><h1>Leave a little note <span>♡</span></h1>
     <p class="guestbook-intro">A tiny guestbook for kind words, recommendations, and hellos. I'd love to know you stopped by.</p>
     <form id="guest-form" class="guest-form">
-      <label for="guest-name">Your name</label><input id="guest-name" name="name" maxlength="35" required placeholder="What should I call you?">
+      <label for="guest-name">Your name</label><input id="guest-name" name="name" maxlength="35" required autocomplete="name" placeholder="What should I call you?">
       <label for="guest-message">Your note</label><textarea id="guest-message" name="message" maxlength="280" required placeholder="Say hello, share a book recommendation, or leave a kind thought..."></textarea>
       <button class="guest-submit" type="submit">Pin my note <span>✦</span></button>
-      <p class="guestbook-small">Notes are saved in this browser on this device.</p>
+      <p class="guestbook-small" id="guest-status" role="status">Messages are shared with everyone who visits this page.</p>
     </form>
-    <div class="guest-notes"><div class="guest-notes-head"><h2>Little notes left here</h2><span>${entries.length} ${entries.length === 1 ? "note" : "notes"}</span></div>
-      <div id="guest-list">${entries.length ? entries.slice().reverse().map(e => `<article class="guest-note"><span class="guest-note-pin">✦</span><p>${esc(e.message)}</p><footer>${esc(e.name)} <time>${esc(e.date)}</time></footer></article>`).join("") : `<div class="guest-empty">The page is still blank. Leave the first little note?</div>`}</div>
+    <div class="guest-notes"><div class="guest-notes-head"><h2>Little notes left here</h2><span id="guest-count">Loading...</span></div>
+      <div id="guest-list"><div class="guest-empty">Loading notes...</div></div>
     </div>
   </section>`;
-  $("#guest-form").addEventListener("submit", e => {
+  const form = $("#guest-form"), status = $("#guest-status");
+  const list = $("#guest-list"), count = $("#guest-count");
+  const renderEntries = entries => {
+    if (!$("#guest-list")) return;
+    count.textContent = `${entries.length} ${entries.length === 1 ? "note" : "notes"}`;
+    list.innerHTML = entries.length ? entries.map(e => {
+      const date = new Date(e.created_at);
+      const dateText = Number.isNaN(date.getTime()) ? "" : date.toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
+      return `<article class="guest-note"><span class="guest-note-pin">✦</span><p>${esc(e.message)}</p><footer>${esc(e.name)} <time>${esc(dateText)}</time></footer></article>`;
+    }).join("") : `<div class="guest-empty">The page is still blank. Leave the first little note?</div>`;
+  };
+
+  if (!supabaseClient) {
+    status.textContent = "The shared guestbook is not connected yet. Add your Supabase URL and anon key in supabase-config.js.";
+    count.textContent = "Not connected";
+    list.innerHTML = `<div class="guest-empty">The guestbook is waiting for its database connection.</div>`;
+    form.addEventListener("submit", e => { e.preventDefault(); status.textContent = "Connect Supabase first, then visitors can share messages here."; });
+    return;
+  }
+
+  const loadEntries = async () => {
+    const { data, error } = await supabaseClient.from("guestbook")
+      .select("id, name, message, created_at").order("created_at", { ascending: false }).limit(100);
+    if (error) {
+      status.textContent = "Couldn't load messages. Please try again in a moment.";
+      list.innerHTML = `<div class="guest-empty">Guestbook messages couldn't be loaded.</div>`;
+      console.error("Guestbook load error:", error.message);
+      return;
+    }
+    renderEntries(data || []);
+  };
+
+  await loadEntries();
+  guestbookChannel = supabaseClient.channel("public-guestbook-live")
+    .on("postgres_changes", { event: "*", schema: "public", table: "guestbook" }, loadEntries)
+    .subscribe(state => {
+      if (state === "SUBSCRIBED") status.textContent = "Messages are shared live with everyone who visits this page.";
+      if (state === "CHANNEL_ERROR" || state === "TIMED_OUT") status.textContent = "Live updates are temporarily unavailable. Refresh to check for new notes.";
+    });
+
+  form.addEventListener("submit", async e => {
     e.preventDefault();
+    const button = $(".guest-submit", form);
     const name = $("#guest-name").value.trim(), message = $("#guest-message").value.trim();
     if (!name || !message) return;
-    const stored = store.get("gargi-guestbook", []);
-    const saved = Array.isArray(stored) ? stored : [];
-    saved.push({ name, message, date: new Date().toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" }) });
-    store.set("gargi-guestbook", saved.slice(-50));
+    button.disabled = true;
+    status.textContent = "Saving your note...";
+    const { error } = await supabaseClient.from("guestbook").insert({ name, message });
+    button.disabled = false;
+    if (error) {
+      status.textContent = "Your note couldn't be saved. Please try again.";
+      console.error("Guestbook insert error:", error.message);
+      return;
+    }
+    form.reset();
+    status.textContent = "Your note has been added. Everyone can see it now.";
     confetti();
-    guestbook();
+    await loadEntries();
   });
 }
 
